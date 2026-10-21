@@ -1,6 +1,6 @@
 # biorigor-cli
 
-Command-line client for a **self-hosted [BioRigor](https://github.com/LudensZhang)** paper-audit server.
+Command-line client for a **self-hosted BioRigor** paper-audit server.
 
 BioRigor runs a four-dimension review of a scientific paper — conceptual novelty,
 dry-lab methods, wet-lab figures, source-data forensics — and returns an HTML report
