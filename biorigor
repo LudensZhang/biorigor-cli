@@ -1,0 +1,626 @@
+#!/usr/bin/env python3
+"""biorigor — command-line client for a self-hosted BioRigor paper-audit server.
+
+Designed to be scriptable, so it can be dropped into an existing workflow:
+
+  * every command supports --json, output goes straight into jq / python
+  * `submit --json` prints just {taskId, ...} so you can pipe the id out
+  * exit codes are meaningful: 0 success / 1 task failed / 2 usage·auth·network
+  * `wait --download` blocks until done and fetches the report
+
+You must point it at your own BioRigor deployment. There is no built-in default
+host — set one of:
+
+  biorigor login --host https://biorigor.example.org
+  export BIORIGOR_HOST=https://biorigor.example.org
+  (or put "host" in ~/.config/biorigor/config.json)
+
+Typical session
+---------------
+  biorigor login --host https://biorigor.example.org
+  biorigor models
+  biorigor submit paper.pdf -s supplement.pdf
+  biorigor wait <taskId> --download ./reports
+
+Environment
+-----------
+  BIORIGOR_HOST      server base URL (skips the prompt / config lookup)
+  BIORIGOR_TOKEN     use this token directly (for CI, no login step)
+  BIORIGOR_PASSWORD  password, for non-interactive login with --user
+  BIORIGOR_CONF_DIR  override the config directory
+
+Python 3.8+, standard library only.
+"""
+
+import argparse
+import getpass
+import glob as globmod
+import json
+import mimetypes
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+
+__version__ = "1.0.0"
+
+CONF_DIR = os.path.expanduser(os.environ.get("BIORIGOR_CONF_DIR", "~/.config/biorigor"))
+CONF_FILE = os.path.join(CONF_DIR, "config.json")
+
+
+class CliError(Exception):
+    """Usage / auth / network problem -> exit code 2."""
+
+
+def die(msg, code=2):
+    print(f"biorigor: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ------------------------------------------------------------------ config
+
+def load_conf():
+    try:
+        with open(CONF_FILE, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def save_conf(conf):
+    os.makedirs(CONF_DIR, exist_ok=True)
+    tmp = CONF_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(conf, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, CONF_FILE)
+    os.chmod(CONF_FILE, 0o600)      # the file holds a session token
+
+
+def normalize_host(url):
+    """Trim, add scheme if missing, drop a trailing /api or /."""
+    url = (url or "").strip()
+    if not url:
+        return ""
+    if not re.match(r"^https?://", url, re.I):
+        url = "https://" + url
+    url = url.rstrip("/")
+    if url.lower().endswith("/api"):
+        url = url[:-4]
+    return url
+
+
+def resolve_host(explicit=None):
+    """--host > $BIORIGOR_HOST > config file > error.
+
+    Deliberately no built-in default: this client is generic and must not
+    assume any particular deployment's address.
+    """
+    for cand in (explicit, os.environ.get("BIORIGOR_HOST"), load_conf().get("host")):
+        if cand:
+            return normalize_host(cand)
+    raise CliError(
+        "no server configured.\n"
+        "  Set it once:   biorigor login --host https://your-biorigor.example.org\n"
+        "  Or per session: export BIORIGOR_HOST=https://your-biorigor.example.org"
+    )
+
+
+def probe(url, timeout=5.0):
+    """GET <url>/api/health -> (ok, ms_or_None, detail)."""
+    t0 = time.time()
+    try:
+        req = urllib.request.Request(
+            normalize_host(url) + "/api/health",
+            headers={"User-Agent": f"biorigor-cli/{__version__}"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read(4096).decode("utf-8", "replace")
+            ms = int((time.time() - t0) * 1000)
+            try:
+                name = json.loads(body).get("name") or ""
+            except Exception:
+                name = ""
+            return r.status == 200, ms, name
+    except urllib.error.HTTPError as e:
+        return False, None, f"HTTP {e.code}"
+    except urllib.error.URLError as e:
+        return False, None, str(e.reason)
+    except Exception as e:
+        return False, None, f"{type(e).__name__}: {e}"
+
+
+# -------------------------------------------------------------------- http
+
+def http(method, url, token=None, body=None, headers=None, timeout=60, raw=False):
+    h = {"User-Agent": f"biorigor-cli/{__version__}"}
+    if token:
+        h["X-BioRigor-Token"] = token
+    if headers:
+        h.update(headers)
+    data = body
+    if isinstance(body, dict):
+        data = json.dumps(body).encode()
+        h.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(url, data=data, headers=h, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            payload = r.read()
+            if raw:
+                return payload
+            try:
+                return json.loads(payload.decode("utf-8"))
+            except Exception:
+                return {"_raw": payload.decode("utf-8", "replace")}
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read().decode("utf-8", "replace")).get("error")
+        except Exception:
+            msg = None
+        raise CliError(f"HTTP {e.code}: {msg or e.reason}")
+    except urllib.error.URLError as e:
+        raise CliError(f"cannot reach {url}: {e.reason}")
+
+
+def multipart(fields, files):
+    """Build a multipart/form-data body with the standard library only."""
+    boundary = "----biorigor" + uuid.uuid4().hex
+    out = []
+    for k, v in fields.items():
+        if v is None or v == "":
+            continue
+        out.append(f"--{boundary}\r\n"
+                   f'Content-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
+    for name, path in files:
+        fn = os.path.basename(path)
+        ctype = mimetypes.guess_type(fn)[0] or "application/octet-stream"
+        out.append(f"--{boundary}\r\n"
+                   f'Content-Disposition: form-data; name="{name}"; filename="{fn}"\r\n'
+                   f"Content-Type: {ctype}\r\n\r\n".encode())
+        with open(path, "rb") as fh:
+            out.append(fh.read())
+        out.append(b"\r\n")
+    out.append(f"--{boundary}--\r\n".encode())
+    return b"".join(out), f"multipart/form-data; boundary={boundary}"
+
+
+def human_bytes(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024.0
+    return f"{n:.1f}TB"
+
+
+STATUS_ICON = {"done": "OK", "running": "..", "queued": "..",
+               "canceling": "--", "canceled": "--", "error": "!!"}
+
+
+def require_auth(args):
+    conf = load_conf()
+    token = os.environ.get("BIORIGOR_TOKEN") or conf.get("token")
+    if not token:
+        raise CliError("not logged in. Run `biorigor login --host <URL>`, "
+                       "or set BIORIGOR_TOKEN.")
+    return resolve_host(getattr(args, "host", None)), token
+
+
+# ------------------------------------------------------------------ commands
+
+def cmd_login(args):
+    host = resolve_host(args.host) if (args.host or os.environ.get("BIORIGOR_HOST")
+                                       or load_conf().get("host")) else None
+    if not host:
+        host = normalize_host(input("BioRigor server URL (e.g. https://biorigor.example.org): "))
+        if not host:
+            raise CliError("a server URL is required")
+    ok, ms, detail = probe(host)
+    if not ok:
+        raise CliError(f"{host} does not look like a BioRigor server ({detail}).\n"
+                       "  Check the URL, scheme (http/https) and that /api/health responds.")
+    user = args.user or input("username: ").strip()
+    if not user:
+        raise CliError("username is required")
+    if args.password_stdin:
+        pw = sys.stdin.readline().rstrip("\n")
+    elif os.environ.get("BIORIGOR_PASSWORD"):
+        pw = os.environ["BIORIGOR_PASSWORD"]
+    else:
+        pw = getpass.getpass("password: ")
+    if not pw:
+        raise CliError("password is required")
+    r = http("POST", host + "/api/login", body={"username": user, "password": pw})
+    token = r.get("token")
+    if not token:
+        raise CliError("login failed: the server returned no token")
+    save_conf({"host": host, "token": token, "username": user,
+               "role": r.get("role"), "savedAt": time.strftime("%Y-%m-%dT%H:%M:%S")})
+    if args.json:
+        print(json.dumps({"ok": True, "host": host, "username": user,
+                          "role": r.get("role")}, ensure_ascii=False))
+    else:
+        print(f"logged in as {user} ({r.get('role')}) @ {host}")
+        print(f"credentials saved to {CONF_FILE} (mode 0600)")
+    return 0
+
+
+def cmd_logout(args):
+    conf = load_conf()
+    if conf.get("token") and conf.get("host"):
+        try:
+            http("POST", conf["host"] + "/api/logout", token=conf["token"], timeout=10)
+        except Exception:
+            pass
+    if os.path.exists(CONF_FILE):
+        os.remove(CONF_FILE)
+    print("logged out; local credentials removed")
+    return 0
+
+
+def cmd_whoami(args):
+    host, token = require_auth(args)
+    me = http("GET", host + "/api/me", token=token)
+    if args.json:
+        print(json.dumps({"host": host, **me}, ensure_ascii=False))
+    else:
+        print(f"  user : {me.get('username')}   role: {me.get('role')}")
+        print(f"  host : {host}")
+        print(f"  admin: {me.get('isAdmin')}   can view all: {me.get('canViewAll')}")
+    return 0
+
+
+def cmd_ping(args):
+    """Probe one or more URLs (or the configured one). Handy when debugging."""
+    urls = args.urls or [resolve_host(getattr(args, "host", None))]
+    rows = []
+    for u in urls:
+        ok, ms, detail = probe(u)
+        rows.append({"url": normalize_host(u), "ok": ok, "ms": ms, "detail": detail})
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False))
+    else:
+        for r in rows:
+            print(f"  {'OK ' if r['ok'] else 'FAIL'} {r['url']:<44} "
+                  f"{str(r['ms']) + ' ms' if r['ok'] else r['detail']}")
+    return 0 if any(r["ok"] for r in rows) else 2
+
+
+def cmd_models(args):
+    host, token = require_auth(args)
+    d = http("GET", host + "/api/models", token=token)
+    if args.json:
+        print(json.dumps(d, ensure_ascii=False))
+        return 0
+    sup = d.get("supportedHarnesses") or {}
+    print("models:")
+    for m in d.get("models", []):
+        star = "*" if m.get("default") else " "
+        engines = ",".join(sup.get(m["id"], [])) or "-"
+        vision = "vision" if m.get("multimodal") else "text"
+        key = "needs-key" if m.get("needsKey") else "no-key"
+        print(f"  {star} {m['id']:<18} {m['label']:<28} {vision:<7} {key:<10} engines: {engines}")
+    print("\nengines:")
+    for h in d.get("harnesses", []):
+        print(f"    {h['id']:<10} {h['label']}")
+    return 0
+
+
+def cmd_submit(args):
+    host, token = require_auth(args)
+    if not os.path.isfile(args.main):
+        raise CliError(f"file not found: {args.main}")
+    files = [("main", args.main)]
+    for s in (args.supp or []):
+        if not os.path.isfile(s):
+            raise CliError(f"file not found: {s}")
+        files.append(("supp", s))
+    body, ctype = multipart({"modelId": args.model or "", "harnessId": args.harness or "",
+                             "apiKey": args.key or ""}, files)
+    r = http("POST", host + "/api/tasks", token=token, body=body,
+             headers={"Content-Type": ctype}, timeout=600)
+    tid = r.get("taskId")
+    if not tid:
+        raise CliError(f"submission failed: {r}")
+    if args.json:
+        print(json.dumps({"ok": True, "taskId": tid, "main": args.main,
+                          "supp": args.supp or []}, ensure_ascii=False))
+    else:
+        print(f"queued: {tid}")
+        print(f"  main: {os.path.basename(args.main)}"
+              + (f"  + {len(args.supp)} supplement(s)" if args.supp else ""))
+        print(f"  next: biorigor wait {tid} --download ./reports")
+    return 0
+
+
+def cmd_batch(args):
+    host, token = require_auth(args)
+    paths = []
+    for pat in args.patterns:
+        hit = sorted(globmod.glob(os.path.expanduser(pat)))
+        if not hit and os.path.isfile(os.path.expanduser(pat)):
+            hit = [os.path.expanduser(pat)]
+        paths.extend(p for p in hit if p.lower().endswith(".pdf"))
+    seen, uniq = set(), []
+    for p in paths:
+        ap = os.path.abspath(p)
+        if ap not in seen:
+            seen.add(ap)
+            uniq.append(ap)
+    if not uniq:
+        raise CliError("no PDF matched")
+
+    results = []
+    for p in uniq:
+        try:
+            body, ctype = multipart({"modelId": args.model or "", "harnessId": args.harness or "",
+                                     "apiKey": args.key or ""}, [("main", p)])
+            r = http("POST", host + "/api/tasks", token=token, body=body,
+                     headers={"Content-Type": ctype}, timeout=600)
+            tid = r.get("taskId")
+            results.append({"main": p, "taskId": tid, "ok": bool(tid)})
+            if not args.json:
+                print(f"  OK {os.path.basename(p):<44} -> {tid}")
+        except CliError as e:
+            results.append({"main": p, "taskId": None, "ok": False, "error": str(e)})
+            if not args.json:
+                print(f"  !! {os.path.basename(p):<44} -> {e}")
+    if args.json:
+        print(json.dumps({"submitted": [r for r in results if r["ok"]],
+                          "failed": [r for r in results if not r["ok"]]}, ensure_ascii=False))
+    else:
+        ok = sum(1 for r in results if r["ok"])
+        print(f"\n{ok}/{len(results)} submitted")
+    if args.wait:
+        ids = [r["taskId"] for r in results if r["ok"]]
+        if not args.json:
+            print("-- waiting --")
+        return wait_many(host, token, ids, args, download_dir=args.download)
+    return 0 if all(r["ok"] for r in results) else 1
+
+
+def cmd_list(args):
+    host, token = require_auth(args)
+    tasks = http("GET", host + "/api/tasks", token=token).get("tasks", [])
+    if args.json:
+        print(json.dumps(tasks, ensure_ascii=False))
+        return 0
+    if not tasks:
+        print("  (no tasks)")
+        return 0
+    print(f"  {'TASK':<18} {'STATUS':<10} {'RISK':<8} {'ENGINE':<10} {'MODEL':<20} FILE")
+    for t in tasks[: args.limit]:
+        print(f"  {t['id']:<18} {str(t.get('status')):<10} {str(t.get('risk') or '-'):<8} "
+              f"{str(t.get('harnessLabel') or '-'):<10} {str(t.get('modelLabel') or '-'):<20} "
+              f"{(t.get('filenames') or {}).get('main', '')[:40]}")
+    if len(tasks) > args.limit:
+        print(f"  ... {len(tasks)} total (use --limit)")
+    return 0
+
+
+def cmd_status(args):
+    host, token = require_auth(args)
+    if not args.ids:
+        tasks = [t for t in http("GET", host + "/api/tasks", token=token).get("tasks", [])
+                 if t.get("status") in ("running", "queued", "canceling")]
+        if args.json:
+            print(json.dumps(tasks, ensure_ascii=False))
+            return 0
+        if not tasks:
+            print("  (nothing queued or running)")
+            return 0
+        for t in tasks:
+            print(f"  {STATUS_ICON.get(t['status'], '?')} {t['id']}  "
+                  f"{str(t.get('status')):<10} {t.get('stage', '')}")
+        return 0
+    out = []
+    for tid in args.ids:
+        t = http("GET", f"{host}/api/tasks/{tid}", token=token)
+        out.append(t)
+        if not args.json:
+            print(f"  {STATUS_ICON.get(t['status'], '?')} {t['id']}  "
+                  f"{str(t.get('status')):<10} {t.get('stage', '')}")
+            if t.get("risk"):
+                print(f"     risk : {t['risk']}")
+            if t.get("error"):
+                print(f"     error: {t['error']}")
+    if args.json:
+        print(json.dumps(out if len(out) > 1 else out[0], ensure_ascii=False))
+    return 0
+
+
+def save_report(host, token, tid, outdir, quiet=False):
+    os.makedirs(outdir, exist_ok=True)
+    data = http("GET", f"{host}/api/tasks/{tid}/report", token=token, raw=True, timeout=180)
+    path = os.path.join(outdir, f"{tid}.html")
+    with open(path, "wb") as fh:
+        fh.write(data)
+    if not quiet:
+        print(f"  report saved: {path} ({human_bytes(len(data))})", file=sys.stderr)
+    return path
+
+
+def wait_many(host, token, ids, args, download_dir=None):
+    """Poll until every task reaches a terminal state. 0=all done, 1=some failed."""
+    pending, done = list(ids), {}
+    t0 = time.time()
+    while pending:
+        if getattr(args, "timeout", 0) and (time.time() - t0) > args.timeout:
+            print(f"  timed out after {args.timeout}s; {len(pending)} still running",
+                  file=sys.stderr)
+            return 1
+        for tid in list(pending):
+            try:
+                t = http("GET", f"{host}/api/tasks/{tid}", token=token)
+            except CliError as e:
+                print(f"  {tid}: poll failed ({e})", file=sys.stderr)
+                continue
+            if t.get("status") in ("done", "error", "canceled"):
+                pending.remove(tid)
+                done[tid] = t
+                print(f"  {STATUS_ICON.get(t['status'], '?')} {tid}  "
+                      f"{str(t.get('status')):<10} risk {str(t.get('risk') or '-'):<8} "
+                      f"{(t.get('filenames') or {}).get('main', '')[:34]}", file=sys.stderr)
+        if pending:
+            print(f"  ... {len(pending)} in progress ({int(time.time() - t0)}s elapsed)",
+                  file=sys.stderr)
+            time.sleep(args.interval)
+    if download_dir:
+        for tid, t in done.items():
+            if t.get("status") == "done":
+                save_report(host, token, tid, download_dir, quiet=bool(args.json))
+    if args.json:
+        print(json.dumps(list(done.values()), ensure_ascii=False))
+    return 0 if all(t.get("status") == "done" for t in done.values()) else 1
+
+
+def cmd_wait(args):
+    host, token = require_auth(args)
+    for tid in args.ids:
+        http("GET", f"{host}/api/tasks/{tid}", token=token)   # validate ids early
+    return wait_many(host, token, args.ids, args, download_dir=args.download)
+
+
+def cmd_report(args):
+    host, token = require_auth(args)
+    t = http("GET", f"{host}/api/tasks/{args.id}", token=token)
+    if not t.get("hasReport") and t.get("status") != "done":
+        raise CliError(f"task {args.id} has no report yet (status: {t.get('status')})")
+    path = save_report(host, token, args.id, args.out, quiet=args.json)
+    if args.json:
+        print(json.dumps({"taskId": args.id, "path": path, "risk": t.get("risk"),
+                          "status": t.get("status"), "partial": bool(t.get("partial"))},
+                         ensure_ascii=False))
+    else:
+        print(f"  task {args.id}  status {t.get('status')}  risk {t.get('risk')}")
+        if t.get("partial"):
+            print("  note: this is an INCOMPLETE report (the run timed out or was interrupted)")
+    return 0
+
+
+def cmd_cancel(args):
+    host, token = require_auth(args)
+    for tid in args.ids:
+        if tid == "all":
+            r = http("POST", host + "/api/tasks/terminate-all", token=token)
+            print(f"  queued discarded: {r.get('canceledQueued', 0)}, "
+                  f"running canceled: {r.get('cancelingRunning', 0)}")
+        else:
+            http("POST", f"{host}/api/tasks/{tid}/cancel", token=token)
+            print(f"  cancel requested: {tid}")
+    return 0
+
+
+def cmd_delete(args):
+    host, token = require_auth(args)
+    for tid in args.ids:
+        http("DELETE", f"{host}/api/tasks/{tid}", token=token)
+        print(f"  deleted: {tid}")
+    return 0
+
+
+# --------------------------------------------------------------------- cli
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="biorigor",
+        description="Command-line client for a self-hosted BioRigor paper-audit server.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples
+  biorigor login --host https://biorigor.example.org
+  biorigor models
+  biorigor submit paper.pdf -s supplement.pdf
+  biorigor wait <taskId> --download ./reports
+  biorigor batch 'papers/*.pdf' --wait --download ./reports --json
+
+  TID=$(biorigor submit p.pdf --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["taskId"])')
+""")
+    p.add_argument("--version", action="version", version=f"biorigor {__version__}")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add(sp, auth=True):
+        if auth:
+            sp.add_argument("--host", help="server base URL (overrides config / env)")
+        sp.add_argument("--json", action="store_true", help="machine-readable output")
+        return sp
+
+    sp = add(sub.add_parser("login", help="authenticate and store the token"), auth=False)
+    sp.add_argument("--host", help="server base URL")
+    sp.add_argument("-u", "--user", help="username")
+    sp.add_argument("--password-stdin", action="store_true", help="read password from stdin")
+    sp.set_defaults(func=cmd_login)
+
+    add(sub.add_parser("logout", help="forget the local token"), auth=False).set_defaults(func=cmd_logout)
+    add(sub.add_parser("whoami", help="show the current user and server")).set_defaults(func=cmd_whoami)
+
+    sp = add(sub.add_parser("ping", help="probe one or more server URLs"), auth=False)
+    sp.add_argument("urls", nargs="*", help="URLs to probe (default: configured host)")
+    sp.add_argument("--host", help="server base URL")
+    sp.set_defaults(func=cmd_ping)
+
+    add(sub.add_parser("models", help="list models, engines and supported pairings")).set_defaults(func=cmd_models)
+
+    sp = add(sub.add_parser("submit", help="submit one paper for audit"))
+    sp.add_argument("main", help="main PDF")
+    sp.add_argument("-s", "--supp", action="append", help="supplementary file (repeatable)")
+    sp.add_argument("--model", help="model id (see `biorigor models`)")
+    sp.add_argument("--harness", help="engine id (see `biorigor models`)")
+    sp.add_argument("--key", help="API key, only needed for remote/paid models")
+    sp.set_defaults(func=cmd_submit)
+
+    sp = add(sub.add_parser("batch", help="submit many PDFs"))
+    sp.add_argument("patterns", nargs="+", help="files or globs")
+    sp.add_argument("--model")
+    sp.add_argument("--harness")
+    sp.add_argument("--key")
+    sp.add_argument("--wait", action="store_true", help="wait for all to finish")
+    sp.add_argument("--download", metavar="DIR", help="with --wait: save reports here")
+    sp.add_argument("--interval", type=int, default=60, help="poll interval in seconds")
+    sp.add_argument("--timeout", type=int, default=0, help="overall timeout in seconds (0=unlimited)")
+    sp.set_defaults(func=cmd_batch)
+
+    sp = add(sub.add_parser("list", help="list your tasks"))
+    sp.add_argument("--limit", type=int, default=25)
+    sp.set_defaults(func=cmd_list)
+
+    sp = add(sub.add_parser("status", help="show task progress (active tasks if no id given)"))
+    sp.add_argument("ids", nargs="*")
+    sp.set_defaults(func=cmd_status)
+
+    sp = add(sub.add_parser("wait", help="block until tasks finish"))
+    sp.add_argument("ids", nargs="+")
+    sp.add_argument("--interval", type=int, default=60, help="poll interval in seconds")
+    sp.add_argument("--timeout", type=int, default=0, help="overall timeout in seconds (0=unlimited)")
+    sp.add_argument("--download", metavar="DIR", help="save reports here when done")
+    sp.set_defaults(func=cmd_wait)
+
+    sp = add(sub.add_parser("report", help="download a report"))
+    sp.add_argument("id")
+    sp.add_argument("-o", "--out", default=".", help="output directory")
+    sp.set_defaults(func=cmd_report)
+
+    sp = add(sub.add_parser("cancel", help="cancel tasks ('all' to cancel everything you can)"))
+    sp.add_argument("ids", nargs="+")
+    sp.set_defaults(func=cmd_cancel)
+
+    sp = add(sub.add_parser("delete", help="delete task records and their artifacts"))
+    sp.add_argument("ids", nargs="+")
+    sp.set_defaults(func=cmd_delete)
+
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    try:
+        return args.func(args)
+    except CliError as e:
+        die(str(e), 2)
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

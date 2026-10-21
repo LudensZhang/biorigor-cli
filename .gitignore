@@ -1,0 +1,17 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# local config / credentials — never commit these
+config.json
+.biorigor/
+*.token
+
+# editor / OS noise
+.DS_Store
+._*
+.idea/
+.vscode/
+*.swp
